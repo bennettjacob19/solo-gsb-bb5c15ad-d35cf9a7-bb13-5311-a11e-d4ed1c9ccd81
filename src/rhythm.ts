@@ -380,6 +380,117 @@ export function compareOutlines(score: Segment[], reference: Segment[]): Outline
   return { kind: 'match' };
 }
 
+/* ---------- 按参考修正记谱（仅切换叶事件 note/rest 类型） ---------- */
+
+/** 记谱叶事件的类型（音符 / 休止符） */
+export type LeafType = 'note' | 'rest';
+
+/** 一处拟修改：将某记谱叶事件的 type 在 note/rest 间切换 */
+export interface NotationFixChange {
+  /** 叶事件树路径，如 measures[3].events[1].events[2] */
+  path: string;
+  /** 修改前类型 */
+  from: LeafType;
+  /** 修改后类型 */
+  to: LeafType;
+  /** 该叶事件覆盖的时间区间（以全音符为 1，从小节起点计） */
+  start: Frac;
+  end: Frac;
+}
+
+/** 无法仅改类型修正的记谱叶事件：参考状态在其内部发生变化 */
+export interface NotationFixBlocker {
+  /** 记谱叶事件树路径 */
+  path: string;
+  /** 该叶事件覆盖的时间区间 */
+  start: Frac;
+  end: Frac;
+  /** 记谱侧状态（发声 / 静音） */
+  scoreState: SegmentState;
+  /** 区间内参考侧的状态变化片段（按时间顺序，相邻同状态已合并） */
+  referenceSegments: { start: Frac; end: Frac; state: SegmentState; paths: string[] }[];
+}
+
+export type NotationFix =
+  | {
+      kind: 'plan';
+      /** 全部拟修改叶（覆盖所有不一致叶事件），按时间顺序 */
+      changes: NotationFixChange[];
+    }
+  | {
+      kind: 'blocked';
+      /** 参考状态在其内部变化的记谱叶事件；存在时不提供任何修改方案 */
+      blockers: NotationFixBlocker[];
+    };
+
+/** 将区间内按时间排列的参考状态片段合并相邻同状态项（同时收集对应的参考叶路径） */
+function mergeStateRuns(
+  hits: { start: Frac; end: Frac; sounding: boolean; path: string }[],
+): { start: Frac; end: Frac; state: SegmentState; paths: string[] }[] {
+  const runs: { start: Frac; end: Frac; state: SegmentState; paths: string[] }[] = [];
+  for (const h of hits) {
+    const state: SegmentState = h.sounding ? 'sounding' : 'silent';
+    const last = runs[runs.length - 1];
+    if (last && last.state === state) {
+      last.end = h.end;
+      if (!last.paths.includes(h.path)) last.paths.push(h.path);
+    } else {
+      runs.push({ start: h.start, end: h.end, state, paths: [h.path] });
+    }
+  }
+  return runs;
+}
+
+/**
+ * 为「两侧时值均正确但发声轮廓不同」的小节计算按参考修正记谱的方案。
+ * 前提：两侧片段由 expandMeasure 展开且总时值相同（覆盖同一时间范围）。
+ *
+ * 以精确分数将两侧叶事件按时间区间对齐，逐叶检查记谱侧叶事件覆盖的参考状态：
+ * - 恒定时：若与记谱状态不一致，生成将该叶 type 在 note/rest 间切换的修改；
+ * - 在其内部变化时：该叶无法仅改类型修正，记入 blockers。
+ * 存在 blocker 时返回 blocked（不给部分方案）；否则返回覆盖全部不一致叶的 plan。
+ */
+export function planNotationFix(scoreSegments: Segment[], referenceSegments: Segment[]): NotationFix {
+  const changes: NotationFixChange[] = [];
+  const blockers: NotationFixBlocker[] = [];
+
+  for (const leaf of scoreSegments) {
+    // 与该记谱叶时间区间相交的参考片段（精确分数求交）
+    const hits: { start: Frac; end: Frac; sounding: boolean; path: string }[] = [];
+    for (const ref of referenceSegments) {
+      if (ref.end.cmp(leaf.start) <= 0 || ref.start.cmp(leaf.end) >= 0) continue;
+      hits.push({
+        start: ref.start.cmp(leaf.start) > 0 ? ref.start : leaf.start,
+        end: ref.end.cmp(leaf.end) < 0 ? ref.end : leaf.end,
+        sounding: ref.sounding,
+        path: ref.path,
+      });
+    }
+    if (hits.length === 0) continue; // 两侧覆盖同一总时长，理论上不会发生
+
+    const runs = mergeStateRuns(hits);
+    if (runs.length > 1) {
+      blockers.push({
+        path: leaf.path,
+        start: leaf.start,
+        end: leaf.end,
+        scoreState: leaf.sounding ? 'sounding' : 'silent',
+        referenceSegments: runs,
+      });
+    } else if (runs[0].state !== (leaf.sounding ? 'sounding' : 'silent')) {
+      changes.push({
+        path: leaf.path,
+        from: leaf.sounding ? 'note' : 'rest',
+        to: leaf.sounding ? 'rest' : 'note',
+        start: leaf.start,
+        end: leaf.end,
+      });
+    }
+  }
+
+  return blockers.length > 0 ? { kind: 'blocked', blockers } : { kind: 'plan', changes };
+}
+
 /* ---------- 不足小节休止符补全建议 ---------- */
 
 const REST_NAME: Record<number, string> = {
@@ -525,9 +636,14 @@ export interface ScoreReport {
    * 任一侧时值非 ok 的小节为 null（仅显示时值问题，不做对照）。
    */
   comparisons: (OutlineComparison | null)[] | null;
+  /**
+   * 逐小节按参考修正记谱的方案；未提供参考时为 null。
+   * 任一侧时值非 ok 的小节为 null（时值异常时不提供修正）。
+   */
+  notationFixes: (NotationFix | null)[] | null;
 }
 
-/** 逐小节分析（含可选的参考演奏对照）。调用前须保证 validateScore 无错误。 */
+/** 逐小节分析（含可选的参考演奏对照与按参考修正记谱方案）。调用前须保证 validateScore 无错误。 */
 export function analyze(score: ScoreInput): ScoreReport {
   const expected = Frac.of(score.timeSignature.numerator, score.timeSignature.denominator);
 
@@ -536,16 +652,26 @@ export function analyze(score: ScoreInput): ScoreReport {
   const refMeasures = score.referenceMeasures;
   const reference = refMeasures ? analyzeMeasures(refMeasures, expected, 'referenceMeasures') : null;
 
-  const comparisons =
-    reference && refMeasures
-      ? measures.map((m, i) => {
-          if (m.status !== 'ok' || reference[i].status !== 'ok') return null;
-          return compareOutlines(
-            expandMeasure(score.measures[i].events, `measures[${i}].events`),
-            expandMeasure(refMeasures[i].events, `referenceMeasures[${i}].events`),
-          );
-        })
-      : null;
+  let comparisons: (OutlineComparison | null)[] | null = null;
+  let notationFixes: (NotationFix | null)[] | null = null;
+  if (reference && refMeasures) {
+    comparisons = [];
+    notationFixes = [];
+    measures.forEach((m, i) => {
+      if (m.status !== 'ok' || reference[i].status !== 'ok') {
+        comparisons!.push(null);
+        notationFixes!.push(null);
+        return;
+      }
+      const scoreSegments = expandMeasure(score.measures[i].events, `measures[${i}].events`);
+      const referenceSegments = expandMeasure(
+        refMeasures[i].events,
+        `referenceMeasures[${i}].events`,
+      );
+      comparisons!.push(compareOutlines(scoreSegments, referenceSegments));
+      notationFixes!.push(planNotationFix(scoreSegments, referenceSegments));
+    });
+  }
 
-  return { measures, reference, comparisons };
+  return { measures, reference, comparisons, notationFixes };
 }

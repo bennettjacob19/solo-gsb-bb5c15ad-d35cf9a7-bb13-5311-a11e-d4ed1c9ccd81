@@ -8,20 +8,26 @@ import {
   restName,
   suggestRests,
   validateScore,
+  type LeafType,
   type MeasureReport,
   type MeasureStatus,
+  type NotationFix,
+  type NoteEvent,
   type OutlineComparison,
   type OutlineDiff,
   type RestEvent,
   type RestSuggestion,
+  type RhythmEvent,
   type ScoreInput,
   type SegmentState,
 } from './rhythm';
 
 type Side = 'score' | 'reference';
 
-/** 预览选中标识：小节序号（从 1 开始）+ 一侧 */
-type Selection = { measureIndex: number; side: Side };
+/** 预览选中标识：小节序号（从 1 开始）+ 预览目标（休止符建议的一侧 / 按参考修正记谱） */
+type Selection =
+  | { measureIndex: number; kind: 'rest'; side: Side }
+  | { measureIndex: number; kind: 'fix' };
 
 type ParseResult = { ok: true; value: unknown } | { ok: false; message: string };
 
@@ -38,6 +44,23 @@ function fmtFrac(f: Frac): string {
   const s = f.toString();
   const mixed = f.toMixed();
   return s === mixed ? s : `${s}（${mixed}）`;
+}
+
+/**
+ * 按树路径（如 measures[3].events[1].events[2]）在某小节事件树内定位叶事件。
+ * 首个下标为小节序号，事件下标从第二个开始；路径非法或目标不是叶事件时返回 null。
+ */
+function getLeaf(events: RhythmEvent[], path: string): NoteEvent | RestEvent | null {
+  const indices = path.match(/\[(\d+)\]/g)?.map((s) => Number(s.slice(1, -1)));
+  if (!indices || indices.length === 0) return null;
+  let list = events;
+  for (let k = 1; k < indices.length - 1; k++) {
+    const node: RhythmEvent | undefined = list[indices[k]];
+    if (!node || node.type !== 'tuplet') return null;
+    list = node.events;
+  }
+  const leaf = list[indices[indices.length - 1]];
+  return leaf && leaf.type !== 'tuplet' ? leaf : null;
 }
 
 function StatusBadge({ status, diff }: { status: MeasureStatus; diff: Frac }) {
@@ -197,6 +220,15 @@ function StateTag({ state }: { state: SegmentState }) {
   );
 }
 
+/** 叶事件类型标签：音符 note / 休止符 rest */
+function TypeChip({ type }: { type: LeafType }) {
+  return (
+    <span className={`state ${type === 'note' ? 'state-sounding' : 'state-silent'}`}>
+      {type === 'note' ? '音符 note' : '休止符 rest'}
+    </span>
+  );
+}
+
 function DiffDetail({ diff }: { diff: OutlineDiff }) {
   return (
     <div className="diff-detail">
@@ -222,25 +254,143 @@ function DiffDetail({ diff }: { diff: OutlineDiff }) {
   );
 }
 
+/** 按参考修正记谱：列出全部拟修改叶路径与前后类型；不可修正时显示原因，不给部分方案 */
+function NotationFixView({
+  fix,
+  scoreEvents,
+  selected,
+  onTogglePreview,
+  onApply,
+}: {
+  fix: NotationFix;
+  /** 该小节记谱侧原始事件树（用于预览定位拟修改叶） */
+  scoreEvents: RhythmEvent[];
+  selected: boolean;
+  onTogglePreview: () => void;
+  onApply: () => void;
+}) {
+  if (fix.kind === 'blocked') {
+    return (
+      <div className="notation-fix blocked">
+        <div className="fix-head">按参考修正记谱</div>
+        <div className="fix-body">
+          以下记谱叶事件内部参考状态发生变化，无法仅通过切换 note/rest 类型修正，不提供部分方案：
+        </div>
+        <ul className="fix-blockers">
+          {fix.blockers.map((b) => (
+            <li key={b.path}>
+              <div className="fix-blocker-head">
+                <code>{b.path}</code>
+                <span className="mixed">
+                  区间 [{fmtFrac(b.start)}, {fmtFrac(b.end)}) · 记谱
+                </span>
+                <StateTag state={b.scoreState} />
+              </div>
+              <ul className="fix-ref-runs">
+                {b.referenceSegments.map((r, i) => (
+                  <li key={i}>
+                    [{fmtFrac(r.start)}, {fmtFrac(r.end)}) 参考 <StateTag state={r.state} />
+                    <span className="mixed">（{r.paths.join('、')}）</span>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  }
+
+  if (fix.changes.length === 0) return null;
+
+  return (
+    <div className="notation-fix">
+      <div className="fix-head">
+        按参考修正记谱
+        <button
+          className={selected ? 'rest-toggle active' : 'rest-toggle'}
+          onClick={onTogglePreview}
+        >
+          {selected ? '取消预览' : '预览修改'}
+        </button>
+      </div>
+      <div className="fix-body">
+        两侧时值均正确，以下 {fix.changes.length}{' '}
+        个记谱叶事件与参考状态不一致，且每个叶覆盖的参考状态恒定，可仅切换
+        type（分母、附点与连音结构保持不变）：
+      </div>
+      <ul className="fix-changes">
+        {fix.changes.map((c) => (
+          <li key={c.path}>
+            <code>{c.path}</code>
+            <TypeChip type={c.from} />
+            <span className="fix-arrow">→</span>
+            <TypeChip type={c.to} />
+            <span className="mixed">
+              区间 [{fmtFrac(c.start)}, {fmtFrac(c.end)})
+            </span>
+          </li>
+        ))}
+      </ul>
+      {selected && (
+        <div className="rest-preview">
+          <div className="rest-preview-title">
+            预览：以下叶事件的 type 将按此切换，其余字段、referenceMeasures 与其他小节不变
+          </div>
+          <pre>
+            {JSON.stringify(
+              fix.changes.map((c) => {
+                const leaf = getLeaf(scoreEvents, c.path);
+                return {
+                  path: c.path,
+                  修改前: leaf,
+                  修改后: leaf ? { ...leaf, type: c.to } : null,
+                };
+              }),
+              null,
+              2,
+            )}
+          </pre>
+          <div className="rest-actions">
+            <button className="apply-btn" onClick={onApply}>
+              应用修正
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** 对照卡片：两侧时值结果 + 演奏轮廓对照结论 */
 function CompareCard({
   score,
   reference,
   comparison,
+  fix,
+  scoreEvents,
   scoreSuggestion,
   referenceSuggestion,
   selectedSide,
+  fixSelected,
   onTogglePreview,
   onApply,
+  onToggleFixPreview,
+  onApplyFix,
 }: {
   score: MeasureReport;
   reference: MeasureReport;
   comparison: OutlineComparison | null;
+  fix: NotationFix | null;
+  scoreEvents: RhythmEvent[];
   scoreSuggestion: RestSuggestion | null;
   referenceSuggestion: RestSuggestion | null;
   selectedSide: Side | null;
+  fixSelected: boolean;
   onTogglePreview: (side: Side) => void;
   onApply: (side: Side) => void;
+  onToggleFixPreview: () => void;
+  onApplyFix: () => void;
 }) {
   // 未对照时取两侧较差状态着色（over 优先于 short）
   const worst: MeasureStatus =
@@ -299,7 +449,20 @@ function CompareCard({
       {comparison === null ? (
         <div className="compare-note">对应小节存在时值问题，修正后再进行演奏轮廓对照。</div>
       ) : (
-        comparison.kind === 'diff' && <DiffDetail diff={comparison.diff} />
+        comparison.kind === 'diff' && (
+          <>
+            <DiffDetail diff={comparison.diff} />
+            {fix && (
+              <NotationFixView
+                fix={fix}
+                scoreEvents={scoreEvents}
+                selected={fixSelected}
+                onTogglePreview={onToggleFixPreview}
+                onApply={onApplyFix}
+              />
+            )}
+          </>
+        )
       )}
     </div>
   );
@@ -331,11 +494,23 @@ export default function App() {
   const referenceSuggestions = buildSuggestions(report?.reference ?? null);
 
   const isSelected = (measureIndex: number, side: Side) =>
-    selection?.measureIndex === measureIndex && selection.side === side;
+    selection?.kind === 'rest' &&
+    selection.measureIndex === measureIndex &&
+    selection.side === side;
 
   const togglePreview = (measureIndex: number, side: Side) => {
     setSelection((cur) =>
-      cur && cur.measureIndex === measureIndex && cur.side === side ? null : { measureIndex, side },
+      cur && cur.kind === 'rest' && cur.measureIndex === measureIndex && cur.side === side
+        ? null
+        : { measureIndex, kind: 'rest', side },
+    );
+  };
+
+  const toggleFixPreview = (measureIndex: number) => {
+    setSelection((cur) =>
+      cur && cur.kind === 'fix' && cur.measureIndex === measureIndex
+        ? null
+        : { measureIndex, kind: 'fix' },
     );
   };
 
@@ -362,13 +537,36 @@ export default function App() {
     setSelection(null);
   };
 
+  /**
+   * 应用按参考修正记谱方案：仅切换该小节 measures 中拟修改叶事件的 type，
+   * 分母、附点、连音结构、referenceMeasures 与其他小节保持不变，更新输入 JSON 后自动重新校对。
+   */
+  const applyFix = (measureIndex: number) => {
+    if (!parsed.ok || !report || !report.notationFixes) return;
+    const fix = report.notationFixes[measureIndex - 1];
+    if (!fix || fix.kind !== 'plan' || fix.changes.length === 0) return;
+
+    // 结构化克隆保证其余事件、referenceMeasures 与其他小节完全不变
+    const next: ScoreInput = structuredClone(parsed.value as ScoreInput);
+    const target = next.measures[measureIndex - 1];
+    for (const change of fix.changes) {
+      const leaf = getLeaf(target.events, change.path);
+      if (!leaf) return;
+      if (change.to === 'note') (leaf as NoteEvent).type = 'note';
+      else (leaf as RestEvent).type = 'rest';
+    }
+
+    setText(JSON.stringify(next, null, 2));
+    setSelection(null);
+  };
+
   return (
     <div className="page">
       <header>
         <h1>节奏小节校对</h1>
         <p className="subtitle">
           粘贴含拍号与逐小节事件树的 JSON，按精确分数核算每个小节的应有 /
-          实际时值；可提供参考演奏，逐小节对照发声轮廓
+          实际时值；可提供参考演奏，逐小节对照发声轮廓并按参考修正记谱
         </p>
       </header>
 
@@ -447,13 +645,22 @@ export default function App() {
                       score={r}
                       reference={report.reference![i]}
                       comparison={report.comparisons![i]}
+                      fix={report.notationFixes![i]}
+                      scoreEvents={(parsed.value as ScoreInput).measures[i].events}
                       scoreSuggestion={scoreSuggestions![i]}
                       referenceSuggestion={referenceSuggestions![i]}
                       selectedSide={
-                        selection?.measureIndex === r.index ? selection.side : null
+                        selection?.kind === 'rest' && selection.measureIndex === r.index
+                          ? selection.side
+                          : null
+                      }
+                      fixSelected={
+                        selection?.kind === 'fix' && selection.measureIndex === r.index
                       }
                       onTogglePreview={(side) => togglePreview(r.index, side)}
                       onApply={(side) => applySuggestion(r.index, side)}
+                      onToggleFixPreview={() => toggleFixPreview(r.index)}
+                      onApplyFix={() => applyFix(r.index)}
                     />
                   ))}
             </div>
@@ -544,6 +751,16 @@ export default function App() {
               <li>
                 轮廓不同则给出最早差异区间的起止时刻、两侧状态（发声 / 静音）
                 及两侧原事件树路径；相同则标记「演奏轮廓一致」。
+              </li>
+              <li>
+                轮廓不同的小节给出「按参考修正记谱」：逐叶按精确分数时间区间对齐参考状态，
+                仅当每个不一致记谱叶覆盖的参考状态恒定时，生成切换其 type（note/rest）的方案
+                ——分母、附点与连音结构不变；列出全部拟修改叶路径与前后类型，
+                可预览后应用，仅更新该小节 <code>measures</code> 的对应叶事件并自动重新校对。
+              </li>
+              <li>
+                参考状态在某个记谱叶事件内部变化时，显示该叶路径、区间与参考状态变化明细，
+                不提供部分方案；无参考或任一侧时值异常时不提供修正。
               </li>
             </ul>
           </div>
