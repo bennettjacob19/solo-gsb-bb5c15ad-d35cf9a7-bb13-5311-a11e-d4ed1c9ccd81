@@ -380,6 +380,74 @@ export function compareOutlines(score: Segment[], reference: Segment[]): Outline
   return { kind: 'match' };
 }
 
+/* ---------- 按参考修正记谱（仅切换叶事件类型） ---------- */
+
+export interface NotationFixChange {
+  /** 记谱侧不一致叶事件的树路径 */
+  path: string;
+  /** 修改前类型 */
+  from: 'note' | 'rest';
+  /** 修改后类型（参考轮廓恒定时参考侧的发声状态） */
+  to: 'note' | 'rest';
+}
+
+export type NotationFix =
+  | {
+      kind: 'plan';
+      /** 全部需要切换类型的叶事件（仅含修改前后类型确实不同的叶事件） */
+      changes: NotationFixChange[];
+    }
+  | {
+      kind: 'blocked';
+      /** 无法仅靠切换类型修正的记谱叶事件路径（取演奏顺序首个） */
+      path: string;
+      start: Frac;
+      end: Frac;
+      /** 该叶内部参考状态的切换时刻 */
+      switchAt: Frac;
+    };
+
+/**
+ * 以精确分数时间区间对齐两侧已展开的叶事件，给出「按参考修正记谱」方案：
+ * 逐个检查记谱叶事件覆盖的参考状态是否恒定。
+ *  - 全部恒定时：将与参考状态不一致的记谱叶事件在 note/rest 间切换（整方案或不做）。
+ *  - 某个叶内部参考状态发生变化时：该叶无法仅靠改类型修正（改了仍只能有一种状态），
+ *    返回 blocked 与该叶路径及内部切换时刻，不给出任何部分方案。
+ * 调用前提：两侧小节时值均等于拍号（叶段连续覆盖同一总时长）。
+ */
+export function planNotationFix(score: Segment[], reference: Segment[]): NotationFix {
+  const changes: NotationFixChange[] = [];
+  let j = 0;
+
+  for (const seg of score) {
+    // 跳过完全位于该叶之前的参考片段（叶段按演奏顺序连续排列）
+    while (j < reference.length && reference[j].end.cmp(seg.start) <= 0) j++;
+
+    let state: boolean | null = null;
+    let switchAt: Frac | null = null;
+    for (let k = j; k < reference.length; k++) {
+      const ref = reference[k];
+      if (ref.start.cmp(seg.end) >= 0) break; // 半开区间，边界相接不算重叠
+      if (state === null) {
+        state = ref.sounding;
+      } else if (ref.sounding !== state) {
+        // 叶内部参考状态切换：首个切换点即与前一参考片段的分界
+        switchAt = ref.start.cmp(seg.start) > 0 ? ref.start : seg.start;
+        break;
+      }
+    }
+
+    if (switchAt !== null || state === null) {
+      return { kind: 'blocked', path: seg.path, start: seg.start, end: seg.end, switchAt: switchAt ?? seg.start };
+    }
+    if (seg.sounding !== state) {
+      changes.push({ path: seg.path, from: seg.sounding ? 'note' : 'rest', to: state ? 'note' : 'rest' });
+    }
+  }
+
+  return { kind: 'plan', changes };
+}
+
 /* ---------- 不足小节休止符补全建议 ---------- */
 
 const REST_NAME: Record<number, string> = {
@@ -525,6 +593,11 @@ export interface ScoreReport {
    * 任一侧时值非 ok 的小节为 null（仅显示时值问题，不做对照）。
    */
   comparisons: (OutlineComparison | null)[] | null;
+  /**
+   * 逐小节「按参考修正记谱」方案；未提供参考时为 null。
+   * 任一侧时值非 ok、或两侧轮廓一致的小节为 null。
+   */
+  notationFixes: (NotationFix | null)[] | null;
 }
 
 /** 逐小节分析（含可选的参考演奏对照）。调用前须保证 validateScore 无错误。 */
@@ -536,16 +609,28 @@ export function analyze(score: ScoreInput): ScoreReport {
   const refMeasures = score.referenceMeasures;
   const reference = refMeasures ? analyzeMeasures(refMeasures, expected, 'referenceMeasures') : null;
 
-  const comparisons =
-    reference && refMeasures
-      ? measures.map((m, i) => {
-          if (m.status !== 'ok' || reference[i].status !== 'ok') return null;
-          return compareOutlines(
-            expandMeasure(score.measures[i].events, `measures[${i}].events`),
-            expandMeasure(refMeasures[i].events, `referenceMeasures[${i}].events`),
-          );
-        })
-      : null;
+  const comparisons: (OutlineComparison | null)[] = [];
+  const notationFixes: (NotationFix | null)[] = [];
+  if (reference && refMeasures) {
+    measures.forEach((m, i) => {
+      if (m.status !== 'ok' || reference[i].status !== 'ok') {
+        comparisons.push(null);
+        notationFixes.push(null);
+        return;
+      }
+      const scoreSegs = expandMeasure(score.measures[i].events, `measures[${i}].events`);
+      const refSegs = expandMeasure(refMeasures[i].events, `referenceMeasures[${i}].events`);
+      const comparison = compareOutlines(scoreSegs, refSegs);
+      comparisons.push(comparison);
+      // 轮廓一致时无需修正
+      notationFixes.push(comparison.kind === 'diff' ? planNotationFix(scoreSegs, refSegs) : null);
+    });
+  }
 
-  return { measures, reference, comparisons };
+  return {
+    measures,
+    reference,
+    comparisons: reference && refMeasures ? comparisons : null,
+    notationFixes: reference && refMeasures ? notationFixes : null,
+  };
 }

@@ -459,6 +459,101 @@ textarea:focus {
   background: rgba(0, 0, 0, 0.08);
 }
 
+/* ---------- 按参考修正记谱 ---------- */
+
+.notation-fix {
+  margin-top: 8px;
+  border: 1px solid rgba(47, 111, 237, 0.4);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 13.5px;
+}
+
+.notation-fix.blocked {
+  border-color: rgba(192, 53, 53, 0.4);
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.fix-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.fix-toggle.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(47, 111, 237, 0.08);
+}
+
+.fix-body {
+  color: var(--text);
+  font-size: 13.5px;
+}
+
+.fix-body code {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.fix-changes {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.fix-changes code {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  margin-right: 8px;
+}
+
+.type-change {
+  color: var(--muted);
+}
+
+.fix-preview {
+  margin-top: 8px;
+  border-top: 1px dashed rgba(0, 0, 0, 0.14);
+  padding-top: 8px;
+}
+
+.fix-preview-title {
+  color: var(--muted);
+  font-size: 12.5px;
+  margin-bottom: 6px;
+}
+
+.fix-preview pre {
+  margin: 0;
+  background: #f6f8fa;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.fix-actions {
+  margin-top: 8px;
+}
+
 .docs {
   margin-top: 16px;
 }
